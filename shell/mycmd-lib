@@ -33,6 +33,34 @@ export _MYCMD_LIB_SELF_FILE
 [ -n "${MYCMD_SHELL_VERBOSE-}" ] && set -o verbose
 
 # ------------------------------------------------------------------------------
+# Set up tracking of functions
+#   This infrastructure is to allow wrapping functions defined by MyCmd and
+#   libraries and commands that use it. The first use case is to audit the
+#   functions to see if explicitly declaring variables local or for export
+#   is omitted.
+#
+#   Starting implementation here before we define any other functions, and then
+#   the full implementation will come later, when other MyCmd support
+#   infrastructure is in place.
+
+# For now, this should only be done if MYCMD_AUDIT_VARIABLES is set.
+if [[ -n "${MYCMD_AUDIT_VARIABLES-}" ]]; then
+	# _MYCMD_FUNCTIONS_BEFORE
+	#   Track any functions that might come from global scope before we define
+	#   our own, to ensure the later function wrapping only wraps functions
+	#   defined by MyCmd and libraries and commands that use it.
+	declare -A _MYCMD_FUNCTIONS_BEFORE=()
+
+	# declare -F output is like:
+	#   declare -f mycmd.err_exit
+	while read -r _ _ fn; do
+		_MYCMD_FUNCTIONS_BEFORE["${f}"]=1
+	done < <({ declare -F; })
+
+	unset fn
+fi
+
+# ------------------------------------------------------------------------------
 # Basic Logging and Output Functions
 #
 #   These are defined as early as possible to enable to be used through-out this
@@ -97,6 +125,132 @@ if [[ -z "${MYCMD_BASE_DIR-}" || ! -d "${MYCMD_BASE_DIR}" ]]; then
 
 	mycmd.trace "Setting MYCMD_BASE_DIR to: ${MYCMD_BASE_DIR}"
 fi
+
+# ------------------------------------------------------------------------------
+# Continue tracking of functions implementation
+
+# Again, for now, this should only be done if MYCMD_AUDIT_VARIABLES is set.
+if [[ -n "${MYCMD_AUDIT_VARIABLES-}" ]]; then
+	# _MYCMD_WRAPPED_FUNCTIONS
+	#   Associative array of functions that have already been wrapped
+	declare -A _MYCMD_WRAPPED_FUNCTIONS=()
+
+	# _mycmd._audit_variables
+	#   Wrapper function that tracks variables before and after execution
+	#   of the function from the parameters, and outputs any variables
+	#   with changed attributes or new, non-explicitly exported variables.
+	function _mycmd._audit_variables() {
+		local -r fn=$1
+		shift
+
+		# Define variables used in the function so they don't get included in the
+		# validation
+		local -A __mycmd_variables=()
+		local __mycmd_result
+
+		# Each line of output from `declare -p` is of this format:
+		# declare <attributes> <variable>[=value]
+		while read -r _ attributes variable_decl; do
+			local variable=${variable_decl%%=*}
+			__mycmd_variables["${variable}"]="${attributes}"
+		done < <({
+			export IFS=$'\0'
+			declare -p
+		}) # Setting IFS to null to avoid having multi-lines in output.
+		# Unset these so they don't show up in scope of "$fn" because of dynamic scope
+		unset _declare attributes variable_decl variable
+
+		"$fn" "${@}"
+		__mycmd_result="$?"
+
+		while read -r _ attributes variable_decl; do
+			local variable=${variable_decl%%=*}
+
+			# Ignore the `variable` which has creeped into this scope
+			if [[ "${variable}" == 'variable' ]]; then
+				continue
+			fi
+
+			if [[ ! -v __mycmd_variables["$variable"] ]]; then
+				if [[ "${attributes}" =~ .*"x".* ]]; then
+					mycmd.log "VARIABLE AUDIT: Found new variable '${variable}' with attributes '${attributes}', explicity exported."
+				else
+					mycmd.log "VARIABLE AUDIT: Found new variable '${variable}' with attributes '${attributes}'."
+				fi
+			else
+				if [[ "${__mycmd_variables["$variable"]}" != "${attributes}" ]]; then
+					mycmd.log "VARIABLE AUDIT: Found exiting variable '${variable}' with changed attributes '${attributes}'."
+				fi
+			fi
+		done < <({
+			export IFS=$'\0'
+			declare -p
+		})
+
+		unset _declare attributes variable_decl
+		return "${__mycmd_result}"
+	}
+
+	# _mycmd.wrap_all_unwrapped_functions
+	#   This should be called after functions are defined but before they are called
+	function _mycmd.wrap_all_unwrapped_functions() {
+		# Technique borrowed from https://www.anardil.net/2018/dynamic-shell-scripting.html
+		local fn_name
+
+		while read -r _ _ fn_name; do
+			# Don't wrap ourself
+			if [[ "${fn_name}" == "${FUNCNAME[0]}" ]]; then
+				mycmd.trace "Not attempting to wrap self, ${FUNCNAME[0]}"
+				continue
+			fi
+
+			# Or functions defined before MyCmd started
+			if [[ -v  _MYCMD_FUNCTIONS_BEFORE["${fn_name}"] ]]; then
+				mycmd.trace "Not attempting to wrap previously defined function, '${fn_name}'."
+				continue
+			fi
+
+			# Or functions we have already wrapped
+			if [[ -v _MYCMD_WRAPPED_FUNCTIONS["${fn_name}"] ]]; then
+				mycmd.trace "Already wrapped function '${fn_name}'."
+				continue
+			fi
+
+			echo >&2 "Wrapping function '${fn_name}'."
+
+			# The idea is to declare a new function that declares the existing function
+			# as a inner function and then calls _mycmd._audit_variables with the
+			# inner function and arguments as arguments
+			local fn_declaration="${fn_name} "'()
+{
+   '$(declare -f -p "${fn_name}")'
+
+    _mycmd._audit_variables "${FUNCNAME[0]}" "${@}"
+}'
+			eval "$fn_declaration"
+			_MYCMD_WRAPPED_FUNCTIONS[${fn_name}]=1
+		done < <(declare -F)
+	}
+
+	_mycmd.wrap_all_unwrapped_functions
+else
+	function _mycmd.wrap_all_unwrapped_functions () {
+		mycmd.trace "Skipping "${FUNCNAME[0]}" because MYCMD_AUDIT_VARIABLES is undefined."
+	}
+fi
+
+# mycmd.run_main
+#   Any MyCmd commands should use this function to call their 'main'
+function mycmd.run_main() {
+	local -r main_fn=$1
+	shift
+
+	mycmd.trace "Running MyCmd Command main"
+
+	# Wrap any functions defined in this script
+	_mycmd.wrap_all_unwrapped_functions
+	"${main_fn}" "${@}"
+}
 
 # -------------------------------------------------------------------------------
 # Library Deferred Commands Support
@@ -200,11 +354,23 @@ function _mycmd._print_stack_trace() {
 
 	mycmd.log "\nThe command ${BASH_COMMAND} triggered a stack trace."
 
-	local -i i
+	local -i i=-1
 	local -i j
+	local -ir call_stack_size="${#FUNCNAME[@]}"
 
-	for i in $(seq 1 $((${#FUNCNAME[@]} - 2))); do
+	while (( i < (call_stack_size - 2) )); do
+		i=$((i + 1))
 		j=$((i + 1))
+
+		if [[ "${FUNCNAME[$i]}" == "${FUNCNAME[0]}" ]]; then
+			continue
+		fi
+
+		if [[ "${FUNCNAME[$i]}" == "_mycmd._audit_variables" ]]; then
+			i=$((i + 1))
+		  	continue
+		fi
+
 		mycmd.log "\t ${BASH_SOURCE[$i]}: ${FUNCNAME[$i]}() called in ${BASH_SOURCE[$j]}:${BASH_LINENO[$i]}"
 	done
 }
@@ -224,6 +390,7 @@ function _mycmd._run_at_exit_deferreds() {
 	# Then, run all of the exit deferreds in reverse order
 	local -ri deferred_at_exit_count="${#_MYCMD_DEFERRED_AT_EXIT[@]}"
 	local -i i
+
 	for ((i = deferred_at_exit_count - 1; i >= 0; i--)); do
 		local command="${_MYCMD_DEFERRED_AT_EXIT[i]}"
 		mycmd.trace "Executing deferred at exit '${command}'."
@@ -237,6 +404,9 @@ function _mycmd._run_at_exit_deferreds() {
 
 trap '_mycmd._print_stack_trace $?' ERR
 trap _mycmd._run_at_exit_deferreds SIGINT SIGTERM EXIT
+
+# In case an error is triggered in any following definitions, make sure everything is wrapped
+_mycmd.wrap_all_unwrapped_functions
 
 # -------------------------------------------------------------------------------
 # MyCmd Operation System Support
@@ -375,6 +545,10 @@ function mycmd.init_bin() {
 	esac
 }
 
+# The above functions can be called during the definition of other functions,
+# so ensure they are wrapped
+_mycmd.wrap_all_unwrapped_functions
+
 # ------------------------------------------------------------------------------
 # MyCmd Sourcing Support
 
@@ -407,6 +581,9 @@ function mycmd.source_mycmd_lib() {
 		if [[ -e "${lib_script}" ]]; then
 			# shellcheck source=/dev/null
 			source "${lib_script}"
+
+			# Wrap any functions defined in the library
+			_mycmd.wrap_all_unwrapped_functions
 
 			# Run any remaining deferreds for the startup
 			_mycmd.run_startup_deferreds "${lib_script}"
@@ -449,6 +626,8 @@ function _mycmd.source_local_override() {
 
 	# shellcheck source=/dev/null
 	[[ -e "${local_lib}" ]] && source "${local_lib}"
+
+	_mycmd.wrap_all_unwrapped_functions
 }
 
 # ------------------------------------------------------------------------------
@@ -651,6 +830,9 @@ function mycmd.get_named_cache_file() {
 
 	echo "${named_cache_file}"
 }
+
+# Wrap the remaining functions from this library
+_mycmd.wrap_all_unwrapped_functions
 
 # Source the local overrides library if it exists
 _mycmd.source_local_override
